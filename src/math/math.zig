@@ -23,7 +23,18 @@ pub fn matMul(
             c.cblas_dgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
                 m, n, k, alpha, a.ptr, k, b.ptr, n, beta, res.ptr, n);
         },
+        i8 => {
+        },
         else => @compileError("Unsupported type for BLAS: " ++ @typeName(T)),
+    }
+}
+
+fn mmi8(a: []const i8, b: []const i8) void {
+    const result: [][]const i8; 
+    for (a) |row| {
+        for (row) |col| {
+
+        }
     }
 }
 
