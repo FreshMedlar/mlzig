@@ -34,6 +34,26 @@ pub fn matMulStatic(
     return res;
 }
 
+pub fn relu(comptime M: type, m:*M) void {
+    for(0..M.row_count) |row| {
+        for(0..M.col_count) |col| {
+            const val = m.get(row, col);
+            if (val < 0) m.set(row, col, 0);
+        }
+    }
+}
+
+pub fn fillRandom(comptime M: type, m: *M, seed: u64) void {
+    var prng = std.rand.DefaultPrng.init(seed);
+    const random = prng.random();
+
+    for (0..M.row_count) |row| {
+        for (0..M.col_count) |col| {
+            const val = random.intRangeAtMost(i8, -10, 10);
+            m.set(row, col, val);
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------------------------
 

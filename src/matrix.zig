@@ -14,7 +14,6 @@ pub fn StaticMatrix(comptime T: type, comptime rows: usize, comptime cols: usize
             self.data[r * cols + c] = val;
         }
         
-        // Export constants so functions can see them
         pub const row_count = rows;
         pub const col_count = cols;
         pub const Type = T;
