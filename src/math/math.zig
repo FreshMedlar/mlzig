@@ -1,5 +1,8 @@
 const std = @import("std");
+const matrix = @import("matrix.zig");
+
 const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
 
 const c = @cImport({@cInclude("cblas.h");
 });
@@ -24,19 +27,44 @@ pub fn matMul(
                 m, n, k, alpha, a.ptr, k, b.ptr, n, beta, res.ptr, n);
         },
         i8 => {
+            matMulStatic(a, b);
         },
         else => @compileError("Unsupported type for BLAS: " ++ @typeName(T)),
     }
 }
 
-fn mmi8(a: []const i8, b: []const i8) void {
-    const result: [][]const i8; 
-    for (a) |row| {
-        for (row) |col| {
-
+pub fn matMulStatic(
+    comptime A: type, 
+    comptime B: type, 
+    a: A, 
+    b: B
+) matrix.StaticMatrix(A.Type, A.row_count, B.col_count) {
+    // Compile-time safety check
+    comptime {
+        if (A.col_count != B.row_count) {
+            @compileError("Matrix dimensions do not match for multiplication!");
         }
     }
+
+    const T = A.Type;
+    var res = matrix.StaticMatrix(T, A.row_count, B.col_count){};
+
+    for (0..A.row_count) |i| {
+        for (0..B.col_count) |j| {
+            var sum: i32 = 0; // Accumulator to prevent overflow
+            for (0..A.col_count) |k| {
+                sum += @as(i32, a.get(i, k)) * @as(i32, b.get(k, j));
+            }
+            // Logic to cast/clamp back to T goes here
+            res.set(i, j, @intCast(std.math.clamp(sum, -128, 127)));
+        }
+    }
+    return res;
 }
+
+
+// -----------------------------------------------------------------------------------------------
+
 
 const expectEqualSlices = std.testing.expectEqualSlices;
 
@@ -60,7 +88,7 @@ test "matMul - f32 (sgemm) validation" {
 
     // Call your dispatch function
     // Parameters: m=2, n=2, k=3
-    matMul(2, 2, 3, 1.0, &a, &b, 0.0, &res);
+    matMul(2, 2, 3, @as(f32, 1.0), &a, &b, @as(f64, 0.0), &res);
 
     try expectEqualSlices(f32, &expected, &res);
 }
@@ -71,7 +99,23 @@ test "matMul - f64 (dgemm) validation" {
     var res = [_]f64{ 0.0, 0.0, 0.0, 0.0 };
     const expected = [_]f64{ 2.0, 4.0, 6.0, 8.0 };
 
-    matMul(2, 2, 2, 1.0, &a, &b, 0.0, &res);
+    matMul(2, 2, 2, @as(f64, 1.0), &a, &b, @as(f64, 0.0), &res);
 
     try expectEqualSlices(f64, &expected, &res);
+}
+
+test "matMul - i8 (Manual)" {
+    const m, const n, const k = .{ 2, 2, 2 };
+    
+    // Using small values to prevent i8 overflow in your current code
+    const a = [_]i8{ 1, 2, 3, 4 };
+    const b = [_]i8{ 1, 0, 0, 1 }; // Identity matrix
+    var res = [_]i8{ 0, 0, 0, 0 };
+
+    matMul(m, n, k, @as(i8, 1), &a, &b, @as(i8, 0), &res);
+
+    try expectEqual(res[0], 1);
+    try expectEqual(res[1], 2);
+    try expectEqual(res[2], 3);
+    try expectEqual(res[3], 4);
 }

@@ -86,6 +86,7 @@ pub fn build(b: *std.Build) void {
     // BLAS libs
     exe.linkSystemLibrary("openblas");
     exe.linkLibC();
+    exe.addIncludePath(.{ .cwd_relative = "/usr/include/openblas" });
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
