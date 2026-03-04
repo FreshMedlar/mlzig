@@ -1,20 +1,20 @@
 const std = @import("std");
 const mlzig = @import("mlzig");
 const analysis = @import("analysis.zig");
+const tests = @import("tests.zig");
 
 const NEURON_COUNT: usize = 10000;
 const MAX_SYNAPSES: usize = 1000000;
 
 const Reservoir = struct {
-    states: [NEURON_COUNT]f32,
-    biases: [NEURON_COUNT]f32,
-    leaks: [NEURON_COUNT]f32,
+    states: [NEURON_COUNT]f32 = undefined,
+    biases: [NEURON_COUNT]f32 = undefined,
+    leaks: [NEURON_COUNT]f32 = undefined,
     
-    active_indices: [NEURON_COUNT]u32,
+    active_indices: [NEURON_COUNT]u32 = undefined,
     active_neuron_count:usize = 0,
     active_mask: [NEURON_COUNT/8]u8 = [_]u8{0} ** (NEURON_COUNT / 8),
-    input_sums: [NEURON_COUNT]f32,
-    
+    input_sums: [NEURON_COUNT]f32 = undefined,
 
     pub fn init() Reservoir {
         return .{
@@ -64,6 +64,10 @@ const SynapsePool = struct {
 
         self.active_count -= 1;
     }
+
+    pub fn rndInit() SynapsePool {
+        
+    }
 };
 
 pub fn updateReservoir(res: *Reservoir) void {
@@ -105,26 +109,57 @@ pub fn addConnection(res: *Reservoir, pool: *SynapsePool, src: u32, dst: u32, w:
     res.markActive(dst);
 }
 
+pub fn initialize(res: *Reservoir, pool: *SynapsePool, active_count: u16) void {
+    // we mark the N as active 
+    for (0..active_count) |i| {
+        res.markActive(@intCast(i));
+    }
+    // create the synapses
+    for (0..active_count) |n| {
+        for (0..active_count) |m| {
+            addConnection(res, pool, @intCast(n), @intCast(m), 0.1);
+        }
+    }
+}
+
 // --------------------------------------------------------------------------
 
-var reservoir = Reservoir.init();
+var reservoir = Reservoir{};
 var synapses = SynapsePool{};
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const params = tests.MGParams{
+        .tau = 17,
+        .beta = 0.2,
+        .gamma = 0.1,
+    };
+    
+    var mg = try tests.MackeyGlass.init(allocator, params, 1.2);
+    defer mg.deinit();
+
+    std.debug.print("Step, Value\n", .{});
+//    for (0..20) |i| {
+//        const val = mg.next();
+//        std.debug.print("{d}, {d:.6}\n", .{ i, val });
+//    }
+
+    initialize(&reservoir, &synapses, 10);
+    
+    for (0..99999) |i| {
+        // input
+        reservoir.states[0] = mg.next();
+
+        forward(&reservoir, &synapses);
+        if (i % 100 == 0) {
+            for (0..5) |n| {std.debug.print("{d:.4}", .{reservoir.states[n]});}
+            std.debug.print("\n", .{});
+        }
+    }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
