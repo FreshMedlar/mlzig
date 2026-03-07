@@ -14,7 +14,6 @@ const Genotype = struct {
 const Reservoir = struct {
     states: [NEURON_COUNT]f32 = undefined,
     prev_states: [NEURON_COUNT]f32 = undefined,
-    biases: [NEURON_COUNT]f32 = undefined,
     leaks: [NEURON_COUNT]f32 = undefined,
     
     active_indices: [NEURON_COUNT]u32 = undefined,
@@ -25,9 +24,22 @@ const Reservoir = struct {
     pub fn init() Reservoir {
         return .{
             .states = [_]f32{0.0} ** NEURON_COUNT,
-            .biases = [_]f32{0.0} ** NEURON_COUNT,
             .leaks = [_]f32{0.8} ** NEURON_COUNT,
         };
+    }
+
+    // pub fn clone(res: *Reservoir) Reservoir {
+    //     return .{
+    //         .states = [_]f32{0.0} ** NEURON_COUNT,
+    //         .leaks = [_]f32{0.8} ** NEURON_COUNT,
+    //     };
+    // }
+    
+    // optimize to reset only firt active_neuron_count?
+    pub fn reset(self: *Reservoir) void {
+        @memset(&self.states, 0.0);
+        @memset(&self.prev_states, 0.0);
+        @memset(&self.input_sums, 0.0);
     }
 
     pub fn markActive(self: *Reservoir, idx: u32) void {
@@ -89,8 +101,8 @@ const SynapsePool = struct {
 };
 
 pub fn updateReservoir(res: *Reservoir) void {
-    for (&res.states, res.biases, res.leaks) |*state, bias, leak| {
-        state.* += (bias - state.*) * leak;
+    for (&res.states, res.leaks) |*state, leak| {
+        state.* += (state.*) * leak;
     }
 }
 
@@ -120,9 +132,8 @@ pub fn forward(res: *Reservoir, pool: *SynapsePool) void {
     for (res.active_indices[0..res.active_neuron_count]) |idx| {
         const input = res.input_sums[idx];
         const leak = res.leaks[idx];
-        const bias = res.biases[idx];
 
-        const activated = std.math.tanh(input + bias);
+        const activated = std.math.tanh(input);
         res.states[idx] = ((1.0 - leak) * res.states[idx]) + (leak * activated);
     }
 } 
@@ -183,25 +194,32 @@ pub fn expand_genome(geno: [50]f32, pheno: *[1000]f32) void {
 }
 
 pub fn fitness(
+    allocator: std.mem.Allocator,
     original_pool: *const SynapsePool, 
+    original_res: *const Reservoir,
     perturbation: [5000]f32,
-    input_data: []f32
+    input_data: []const f32
 ) f32 {
-    var worker_pool = original_pool.*;
+    var worker_pool = try allocator.create(SynapsePool);
+    defer allocator.destroy(worker_pool);
+    worker_pool.* = original_pool.*;
 
     for (perturbation, 0..) |p, i| {
         worker_pool.coeffs[i] += p;
     }
 
-    var worker_res = Reservoir.init();
+    var worker_res = try allocator.create(Reservoir);
+    defer allocator.destroy(worker_res);
+    worker_res.* = original_res.*;
+    worker_res.reset();
 
     var total_error: f32 = 0.0;
     for(input_data) |val| {
         worker_res.states[0] = val;
-        forward(&worker_res, &worker_pool);
-        applyPlasticity(&worker_res, &worker_pool);
+        forward(worker_res, worker_pool);
+        applyPlasticity(worker_res, worker_pool);
 
-        // TODO readout
+        // TODO readout and error calc
         total_error += 0.01;
     }
 
