@@ -100,6 +100,27 @@ const SynapsePool = struct {
     }
 };
 
+const Readout = struct {
+    weights: [NEURON_COUNT]f32, 
+    bias: f32,
+
+    pub fn initReadout() Readout {
+        return .{
+            .weights = [_]f32{0.0} ** NEURON_COUNT,
+            .bias = 0.0,
+        };
+    }
+};
+
+pub fn computeReadout(res: *const Reservoir, readout: *const Readout) f32 {
+    var sum: f32 = readout.bias;
+
+    for (res.active_indices[0..res.active_neuron_count]) |idx| {
+        sum += res.states[idx] * readout.weights[idx];
+    }
+    return sum;
+}
+
 pub fn updateReservoir(res: *Reservoir) void {
     for (&res.states, res.leaks) |*state, leak| {
         state.* += (state.*) * leak;
@@ -109,7 +130,7 @@ pub fn updateReservoir(res: *Reservoir) void {
 pub fn forward(res: *Reservoir, pool: *SynapsePool) void {
     // we save res.states for the weights update
     // note that we may need to save the state before injecting the input
-    @memcpy(res.prev_states, res.states);
+    @memcpy(&res.prev_states, &res.states);
 
     // prepare n input for n active_neurons
     for (res.active_indices[0..res.active_neuron_count]) |idx| {
@@ -197,9 +218,11 @@ pub fn fitness(
     allocator: std.mem.Allocator,
     original_pool: *const SynapsePool, 
     original_res: *const Reservoir,
-    perturbation: [5000]f32,
-    input_data: []const f32
-) f32 {
+    readout: *const Readout,
+    perturbation: []const f32,
+    input_data: []const f32,
+    target_data: []const f32
+) !f32 {
     var worker_pool = try allocator.create(SynapsePool);
     defer allocator.destroy(worker_pool);
     worker_pool.* = original_pool.*;
@@ -213,17 +236,28 @@ pub fn fitness(
     worker_res.* = original_res.*;
     worker_res.reset();
 
-    var total_error: f32 = 0.0;
-    for(input_data) |val| {
+    var total_sq_error: f32 = 0.0;
+    for(input_data, 0..) |val, i| {
         worker_res.states[0] = val;
         forward(worker_res, worker_pool);
         applyPlasticity(worker_res, worker_pool);
 
-        // TODO readout and error calc
-        total_error += 0.01;
+        const prediction = computeReadout(worker_res, readout);
+        const error_val = prediction - target_data[i];
+        total_sq_error += error_val * error_val;
     }
 
-    return total_error;
+    return total_sq_error / @as(f32, @floatFromInt(input_data.len));
+}
+
+// washout plasticity may be a problem, also the washout should be on the training data
+// otherwise initial performance will be low
+pub fn washout(res: *Reservoir, pool: *SynapsePool, input_data: []const f32) void {
+    for (input_data) |val| {
+        res.states[0] = val; 
+        forward(res, pool);
+        applyPlasticity(res, pool);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -253,7 +287,7 @@ pub fn main() !void {
 
     initialize(&reservoir, &synapses, 10);
     
-    for (0..99) |i| {
+    for (0..999) |i| {
         // input
         reservoir.states[0] = mg.next();
 
