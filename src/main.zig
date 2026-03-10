@@ -63,7 +63,7 @@ const SynapsePool = struct {
     coeffs: [MAX_SYNAPSES * 5]f32 = undefined,
     act_syn: usize = 0,
 
-    pub fn addConnection(self: *SynapsePool, src: u32, dst: u32, w: f32, c: [5]f32) void {
+    pub fn addConnection(self: *SynapsePool, res: *Reservoir, src: u32, dst: u32, w: f32, c: [5]f32) void {
         if (self.act_syn >= MAX_SYNAPSES) return;
 
         const idx = self.act_syn;
@@ -76,6 +76,9 @@ const SynapsePool = struct {
             self.coeffs[c_offset + i] = c[i];
         }
         self.act_syn += 1;
+
+        res.markActive(src);
+        res.markActive(dst);
     }
 
     pub fn pruneConnection(self: *SynapsePool, index: usize) void {
@@ -175,16 +178,6 @@ pub fn applyPlasticity(res: *Reservoir, pool: *SynapsePool) void {
     }
 }
 
-pub fn addConnection(res: *Reservoir, pool: *SynapsePool, src: u32, dst: u32, w: f32, c: [5]f32) void {
-    // 1. Add the synapse to the pool
-    pool.addConnection(src, dst, w, c);
-
-    // 2. Register these neurons as active
-    // This adds them to the active_indices list if they aren't there already
-    res.markActive(src);
-    res.markActive(dst);
-}
-
 pub fn initialize(res: *Reservoir, pool: *SynapsePool, active_count: u16) void {
     const default_coeffs = [_]f32{0.0} ** 5;
 
@@ -192,10 +185,11 @@ pub fn initialize(res: *Reservoir, pool: *SynapsePool, active_count: u16) void {
     for (0..active_count) |i| {
         res.markActive(@intCast(i));
     }
+
     // create the synapses
     for (0..active_count) |n| {
         for (0..active_count) |m| {
-            addConnection(res, pool, @intCast(n), @intCast(m), 0.1, default_coeffs);
+            pool.addConnection(res, @intCast(n), @intCast(m), 0.1, default_coeffs);
         }
     }
 }
@@ -260,12 +254,36 @@ pub fn washout(res: *Reservoir, pool: *SynapsePool, input_data: []const f32) voi
     }
 }
 
+pub fn generateNoise(buffer: []f32, std_dev: f32) void {
+        
+}
+
+pub fn evaluateOffsprint(base_genome: []const f32, perturbation: []const f32) f32 {
+    // generate random from seed
+
+    // use fitness function to evaluate
+    
+    // return fitness score and seed 
+}
+
+pub fn runEvolution(epochs: usize, population: usize, initial_genome: []f32) void {
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+
+    // generate random seed for thread pool
+
+    // start workers
+
+    // compare fitness scores, pick best seeds, expand and apply to base genome
+}
+
 // --------------------------------------------------------------------------
 
 var reservoir = Reservoir{};
 var synapses = SynapsePool{};
 
 pub fn main() !void {
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -280,11 +298,6 @@ pub fn main() !void {
     defer mg.deinit();
 
     std.debug.print("Step, Value\n", .{});
-//    for (0..20) |i| {
-//        const val = mg.next();
-//        std.debug.print("{d}, {d:.6}\n", .{ i, val });
-//    }
-
     initialize(&reservoir, &synapses, 10);
     
     for (0..999) |i| {
