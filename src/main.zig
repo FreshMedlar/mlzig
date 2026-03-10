@@ -15,17 +15,20 @@ const Reservoir = struct {
     states: [NEURON_COUNT]f32 = undefined,
     prev_states: [NEURON_COUNT]f32 = undefined,
     leaks: [NEURON_COUNT]f32 = undefined,
-    
-    active_indices: [NEURON_COUNT]u32 = undefined,
-    active_neuron_count:usize = 0,
-    active_mask: [NEURON_COUNT/8]u8 = [_]u8{0} ** (NEURON_COUNT / 8),
-    input_sums: [NEURON_COUNT]f32 = undefined, 
 
-    pub fn init() Reservoir {
-        return .{
-            .states = [_]f32{0.0} ** NEURON_COUNT,
-            .leaks = [_]f32{0.8} ** NEURON_COUNT,
-        };
+    active_indices: [NEURON_COUNT]u32 = undefined,
+    active_neuron_count: usize = 0,
+    active_mask: [NEURON_COUNT / 8]u8 = [_]u8{0} ** (NEURON_COUNT / 8),
+    input_sums: [NEURON_COUNT]f32 = undefined,
+
+    pub fn init(self: *Reservoir) void {
+        @memset(&self.states, 0.0);
+        @memset(&self.prev_states, 0.0);
+        @memset(&self.leaks, 0.8);
+        @memset(&self.active_indices, 0);
+        self.active_neuron_count = 0;
+        @memset(&self.active_mask, 0);
+        @memset(&self.input_sums, 0.0);
     }
 
     // pub fn clone(res: *Reservoir) Reservoir {
@@ -34,7 +37,7 @@ const Reservoir = struct {
     //         .leaks = [_]f32{0.8} ** NEURON_COUNT,
     //     };
     // }
-    
+
     // optimize to reset only firt active_neuron_count?
     pub fn reset(self: *Reservoir) void {
         @memset(&self.states, 0.0);
@@ -98,20 +101,32 @@ const SynapsePool = struct {
         self.act_syn -= 1;
     }
 
-    pub fn rndInit() SynapsePool {
-        
+    // TODO
+    pub fn rndInit(self: *SynapsePool) void {
+        @memset(&self.weights, 0.0);
+        @memset(&self.sources, 0);
+        @memset(&self.targets, 0);
+        @memset(&self.coeffs, 0.0);
+        self.act_syn = 0;
     }
 };
 
+const WorkerContext = struct {
+    worker_pool: *SynapsePool,
+    worker_res: *Reservoir,
+    worker_readout: *Readout,
+    base_pool: *const SynapsePool,
+    base_res: *const Reservoir,
+    base_readout: *const Readout,
+};
+
 const Readout = struct {
-    weights: [NEURON_COUNT]f32, 
+    weights: [NEURON_COUNT]f32,
     bias: f32,
 
-    pub fn initReadout() Readout {
-        return .{
-            .weights = [_]f32{0.0} ** NEURON_COUNT,
-            .bias = 0.0,
-        };
+    pub fn init(self: *Readout) void {
+        @memset(&self.weights, 0.0);
+        self.bias = 0.0;
     }
 };
 
@@ -139,19 +154,15 @@ pub fn forward(res: *Reservoir, pool: *SynapsePool) void {
     for (res.active_indices[0..res.active_neuron_count]) |idx| {
         res.input_sums[idx] = 0.0;
     }
-    
+
     // we cycle through all the synapses
-    for (
-        pool.weights[0..pool.act_syn],
-        pool.sources[0..pool.act_syn], 
-        pool.targets[0..pool.act_syn]
-    ) |w, src, dst| {
+    for (pool.weights[0..pool.act_syn], pool.sources[0..pool.act_syn], pool.targets[0..pool.act_syn]) |w, src, dst| {
         res.input_sums[dst] += w * res.states[src];
     }
 
     // beware race conditions if modifying this code: the algo must remain order independent,
     // the loops must be separate, or use a buffer
-    
+
     // we compute the actual per-neuron input
     for (res.active_indices[0..res.active_neuron_count]) |idx| {
         const input = res.input_sums[idx];
@@ -160,7 +171,7 @@ pub fn forward(res: *Reservoir, pool: *SynapsePool) void {
         const activated = std.math.tanh(input);
         res.states[idx] = ((1.0 - leak) * res.states[idx]) + (leak * activated);
     }
-} 
+}
 
 pub fn applyPlasticity(res: *Reservoir, pool: *SynapsePool) void {
     for (0..pool.act_syn) |i| {
@@ -170,7 +181,7 @@ pub fn applyPlasticity(res: *Reservoir, pool: *SynapsePool) void {
         const post = res.states[dst];
 
         const c = pool.coeffs[i * 5 .. i * 5 + 5];
-        const delta = c[0] * (c[1]*pre*post + c[2]*pre + c[3]*post + c[4]);
+        const delta = c[0] * (c[1] * pre * post + c[2] * pre + c[3] * post + c[4]);
 
         pool.weights[i] += delta;
 
@@ -181,7 +192,7 @@ pub fn applyPlasticity(res: *Reservoir, pool: *SynapsePool) void {
 pub fn initialize(res: *Reservoir, pool: *SynapsePool, active_count: u16) void {
     const default_coeffs = [_]f32{0.0} ** 5;
 
-    // we mark the N as active 
+    // we mark the N as active
     for (0..active_count) |i| {
         res.markActive(@intCast(i));
     }
@@ -209,34 +220,52 @@ pub fn expand_genome(geno: [50]f32, pheno: *[1000]f32) void {
 }
 
 pub fn fitness(
-    allocator: std.mem.Allocator,
-    original_pool: *const SynapsePool, 
-    original_res: *const Reservoir,
-    readout: *const Readout,
-    perturbation: []const f32,
+    ctx: *WorkerContext,
+    seed: u64,
     input_data: []const f32,
-    target_data: []const f32
-) !f32 {
-    var worker_pool = try allocator.create(SynapsePool);
-    defer allocator.destroy(worker_pool);
-    worker_pool.* = original_pool.*;
+    target_data: []const f32,
+    std_dev: f32,
+) f32 {
+    // generate perturbations here
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
 
-    for (perturbation, 0..) |p, i| {
-        worker_pool.coeffs[i] += p;
+    @memcpy(&ctx.worker_pool.weights, &ctx.base_pool.weights);
+    @memcpy(&ctx.worker_pool.sources, &ctx.base_pool.sources);
+    @memcpy(&ctx.worker_pool.targets, &ctx.base_pool.targets);
+    @memcpy(&ctx.worker_pool.coeffs, &ctx.base_pool.coeffs);
+    ctx.worker_pool.act_syn = ctx.base_pool.act_syn;
+
+    @memcpy(&ctx.worker_res.states, &ctx.base_res.states);
+    @memcpy(&ctx.worker_res.prev_states, &ctx.base_res.prev_states);
+    @memcpy(&ctx.worker_res.leaks, &ctx.base_res.leaks);
+    @memcpy(&ctx.worker_res.active_indices, &ctx.base_res.active_indices);
+    ctx.worker_res.active_neuron_count = ctx.base_res.active_neuron_count;
+    @memcpy(&ctx.worker_res.active_mask, &ctx.base_res.active_mask);
+    @memcpy(&ctx.worker_res.input_sums, &ctx.base_res.input_sums);
+
+    @memcpy(&ctx.worker_readout.weights, &ctx.base_readout.weights);
+    ctx.worker_readout.bias = ctx.base_readout.bias;
+    ctx.worker_res.reset();
+
+    for (0..ctx.worker_pool.act_syn * 5) |i| {
+        const perturbation = random.floatNorm(f32) * std_dev;
+        ctx.worker_pool.coeffs[i] += perturbation;
+    }
+    for (0..ctx.worker_readout.weights.len) |i| {
+        const perturbation = random.floatNorm(f32) * std_dev;
+        ctx.worker_readout.weights[i] += perturbation;
     }
 
-    var worker_res = try allocator.create(Reservoir);
-    defer allocator.destroy(worker_res);
-    worker_res.* = original_res.*;
-    worker_res.reset();
-
+    // SIMULATION
     var total_sq_error: f32 = 0.0;
-    for(input_data, 0..) |val, i| {
-        worker_res.states[0] = val;
-        forward(worker_res, worker_pool);
-        applyPlasticity(worker_res, worker_pool);
+    for (input_data, 0..) |val, i| {
+        ctx.worker_res.states[0] = val;
 
-        const prediction = computeReadout(worker_res, readout);
+        forward(ctx.worker_res, ctx.worker_pool);
+        applyPlasticity(ctx.worker_res, ctx.worker_pool);
+
+        const prediction = computeReadout(ctx.worker_res, ctx.worker_readout);
         const error_val = prediction - target_data[i];
         total_sq_error += error_val * error_val;
     }
@@ -248,42 +277,73 @@ pub fn fitness(
 // otherwise initial performance will be low
 pub fn washout(res: *Reservoir, pool: *SynapsePool, input_data: []const f32) void {
     for (input_data) |val| {
-        res.states[0] = val; 
+        res.states[0] = val;
         forward(res, pool);
         applyPlasticity(res, pool);
     }
 }
 
-pub fn generateNoise(buffer: []f32, std_dev: f32) void {
-        
-}
-
-pub fn evaluateOffsprint(base_genome: []const f32, perturbation: []const f32) f32 {
-    // generate random from seed
-
-    // use fitness function to evaluate
-    
-    // return fitness score and seed 
-}
-
-pub fn runEvolution(epochs: usize, population: usize, initial_genome: []f32) void {
+pub fn runEvolution(
+    pool: *std.Thread.Pool,
+    comptime population: usize,
+    contexts: []WorkerContext,
+    input_data: []const f32,
+    target_data: []const f32,
+    std_dev: f32,
+) !void {
     var prng = std.Random.DefaultPrng.init(42);
-    const random = prng.random();
 
-    // generate random seed for thread pool
+    var wg = std.Thread.WaitGroup{};
+    const num_workers = contexts.len;
+    const chunk_size = population / num_workers;
+    var scores: [population]f32 = undefined;
+    var seeds: [population]u64 = undefined;
+
+    // generate seeds
+    for (&seeds) |*s| {
+        s.* = prng.random().int(u64);
+    }
 
     // start workers
+    var start_idx: usize = 0;
+    for (0..num_workers) |w| {
+        const end_idx = if (w == num_workers - 1) population else start_idx + chunk_size;
+        // spawnWg increments the counter and adds the task to the pool
+        pool.spawnWg(&wg, evaluateBatch, .{
+            &contexts[w],
+            seeds[start_idx..end_idx],
+            scores[start_idx..end_idx],
+            input_data,
+            target_data,
+            std_dev,
+        });
+
+        start_idx = end_idx;
+    }
+
+    // This blocks the Main Thread until all 100 individuals are evaluated
+    wg.wait();
 
     // compare fitness scores, pick best seeds, expand and apply to base genome
+    std.debug.print("All 100 evaluated. Selection starting...\n", .{});
+}
+
+pub fn evaluateBatch(
+    ctx: *WorkerContext,
+    seeds: []const u64,
+    scores: []f32,
+    input_data: []const f32,
+    target_data: []const f32,
+    std_dev: f32,
+) void {
+    for (seeds, 0..) |seed, i| {
+        scores[i] = fitness(ctx, seed, input_data, target_data, std_dev);
+    }
 }
 
 // --------------------------------------------------------------------------
 
-var reservoir = Reservoir{};
-var synapses = SynapsePool{};
-
 pub fn main() !void {
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -293,26 +353,72 @@ pub fn main() !void {
         .beta = 0.2,
         .gamma = 0.1,
     };
-    
+
     var mg = try tests.MackeyGlass.init(allocator, params, 1.2);
     defer mg.deinit();
+    // DATA GENERATION
+    const sequence_len = 500;
+    const input_data = try allocator.alloc(f32, sequence_len);
+    defer allocator.free(input_data);
+    const target_data = try allocator.alloc(f32, sequence_len);
+    defer allocator.free(target_data);
 
-    std.debug.print("Step, Value\n", .{});
-    initialize(&reservoir, &synapses, 10);
-    
-    for (0..999) |i| {
-        // input
-        reservoir.states[0] = mg.next();
+    // warm-up
+    for (0..100) |_| { _ = mg.next(); }
+    // gen
+    var current_val = mg.next();
+    for (0..sequence_len) |i| {
+        const next_val = mg.next();
+        input_data[i] = current_val;
+        target_data[i] = next_val;
+        current_val = next_val;
+    }
 
-        forward(&reservoir, &synapses);
-        applyPlasticity(&reservoir, &synapses);
+    const reservoir = try allocator.create(Reservoir);
+    defer allocator.destroy(reservoir);
+    reservoir.init();
 
-        if (i % 100 == 0) {
-            for (0..5) |n| {std.debug.print("{d:.4}", .{reservoir.states[n]});}
-            std.debug.print("\n", .{});
+    const synapses = try allocator.create(SynapsePool);
+    defer allocator.destroy(synapses);
+    synapses.rndInit();
+
+    const readout = try allocator.create(Readout);
+    defer allocator.destroy(readout);
+    readout.init();
+
+    initialize(reservoir, synapses, 10);
+
+    // threads pool
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{ .allocator = allocator, .n_jobs = 6 });
+    defer pool.deinit();
+
+    // create workers
+    var contexts: [6]WorkerContext = undefined;
+    for (0..6) |i| {
+        contexts[i] = .{
+            .worker_pool = try allocator.create(SynapsePool),
+            .worker_res = try allocator.create(Reservoir),
+            .worker_readout = try allocator.create(Readout),
+            .base_pool = synapses,
+            .base_res = reservoir,
+            .base_readout = readout,
+        };
+    }
+
+    defer {
+        for (contexts) |ctx| {
+            allocator.destroy(ctx.worker_pool);
+            allocator.destroy(ctx.worker_res);
+            allocator.destroy(ctx.worker_readout);
         }
     }
+
+    const std_dev: f32 = 0.05;
+    try runEvolution(&pool, 36, &contexts, input_data, target_data, std_dev);
 }
+
+
 
 
 
