@@ -230,12 +230,13 @@ pub fn fitness(
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
 
+    // SYNAPSES TODO we may not neet to copy all the coefficients
     @memcpy(&ctx.worker_pool.weights, &ctx.base_pool.weights);
     @memcpy(&ctx.worker_pool.sources, &ctx.base_pool.sources);
     @memcpy(&ctx.worker_pool.targets, &ctx.base_pool.targets);
     @memcpy(&ctx.worker_pool.coeffs, &ctx.base_pool.coeffs);
     ctx.worker_pool.act_syn = ctx.base_pool.act_syn;
-
+    // RESERVOIR
     @memcpy(&ctx.worker_res.states, &ctx.base_res.states);
     @memcpy(&ctx.worker_res.prev_states, &ctx.base_res.prev_states);
     @memcpy(&ctx.worker_res.leaks, &ctx.base_res.leaks);
@@ -243,7 +244,7 @@ pub fn fitness(
     ctx.worker_res.active_neuron_count = ctx.base_res.active_neuron_count;
     @memcpy(&ctx.worker_res.active_mask, &ctx.base_res.active_mask);
     @memcpy(&ctx.worker_res.input_sums, &ctx.base_res.input_sums);
-
+    // READOUT
     @memcpy(&ctx.worker_readout.weights, &ctx.base_readout.weights);
     ctx.worker_readout.bias = ctx.base_readout.bias;
     ctx.worker_res.reset();
@@ -324,8 +325,30 @@ pub fn runEvolution(
     // This blocks the Main Thread until all 100 individuals are evaluated
     wg.wait();
 
-    // compare fitness scores, pick best seeds, expand and apply to base genome
+    // compare fitness scores, pick 25% best seeds, expand and apply to base genome
     std.debug.print("All 100 evaluated. Selection starting...\n", .{});
+    const winners: usize = comptime population/4;
+    std.mem.sort(f32, &scores, {}, std.sort.desc(f32));
+    const elite: [winners]f32 = undefined;
+    @memcpy(&elite, scores[0..winners]);
+
+    const winners_weights: [winners]f32 = undefined;
+    var sum: f32 = 0.0;
+    for (0..winners) |i| { 
+        winners_weights[i] = std.math.log(winners+0.5) - std.math.log(i + 1);
+        sum+=winners_weights[i];
+    }
+    for (0..winners_weights) |i| { winners_weights[i] = winners_weights[i] / sum; }
+
+    // expand the weights 
+    var out_mean: []f64 = 0.0;
+    for (0..winners) |i| {
+        const log_weight = winners_weights[i];
+        const params = 0.0; // TODO should be the evolved weights
+        for (0..winners) |j| {
+            out_mean[j] += log_weight * params[j];
+        }
+    }
 }
 
 pub fn evaluateBatch(
@@ -348,14 +371,15 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // TEST DATA
     const params = tests.MGParams{
         .tau = 17,
         .beta = 0.2,
         .gamma = 0.1,
     };
-
     var mg = try tests.MackeyGlass.init(allocator, params, 1.2);
     defer mg.deinit();
+
     // DATA GENERATION
     const sequence_len = 500;
     const input_data = try allocator.alloc(f32, sequence_len);
@@ -374,6 +398,7 @@ pub fn main() !void {
         current_val = next_val;
     }
 
+    // PARAMETER DEFINITION
     const reservoir = try allocator.create(Reservoir);
     defer allocator.destroy(reservoir);
     reservoir.init();
