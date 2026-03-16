@@ -332,16 +332,16 @@ pub fn runEvolution(
     const elite: [winners]f32 = undefined;
     @memcpy(&elite, scores[0..winners]);
 
-    const winners_weights: [winners]f32 = undefined;
+    var winners_weights: [winners]f32 = undefined;
     var sum: f32 = 0.0;
     for (0..winners) |i| { 
         winners_weights[i] = std.math.log(winners+0.5) - std.math.log(i + 1);
         sum+=winners_weights[i];
     }
-    for (0..winners_weights) |i| { winners_weights[i] = winners_weights[i] / sum; }
+    for (0..winners) |i| { winners_weights[i] = winners_weights[i] / sum; }
 
     // expand the weights 
-    var out_mean: []f64 = 0.0;
+    var out_mean: [winners]f64 = undefined;
     for (0..winners) |i| {
         const log_weight = winners_weights[i];
         const params = 0.0; // TODO should be the evolved weights
