@@ -3,9 +3,12 @@ const mlzig = @import("mlzig");
 const analysis = @import("analysis.zig");
 const tests = @import("tests.zig");
 
-const NEURON_COUNT: usize = 10000;
+const print = std.debug.print;
+
+const NEURON_COUNT: usize = 500;
 const COMPRESSED_SIZE: usize = 50;
-const MAX_SYNAPSES: usize = 1000000;
+const MAX_SYNAPSES: usize = 10000;
+const NUM_WORKERS: usize = 11;
 
 const Genotype = struct {
     compressed_coeffs: [5][COMPRESSED_SIZE]f32,
@@ -219,37 +222,37 @@ pub fn fitness(
     target_data: []const f32,
     sigma: f32,
 ) f32 {
+    const active_syn = ctx.base_pool.act_syn;
+    const active_nrn = ctx.base_res.active_neuron_count;
+
     // generate perturbations here
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
 
     // SYNAPSES TODO we may not neet to copy all the coefficients
-    @memcpy(&ctx.worker_pool.weights, &ctx.base_pool.weights);
-    @memcpy(&ctx.worker_pool.sources, &ctx.base_pool.sources);
-    @memcpy(&ctx.worker_pool.targets, &ctx.base_pool.targets);
-    @memcpy(&ctx.worker_pool.coeffs, &ctx.base_pool.coeffs);
-    ctx.worker_pool.act_syn = ctx.base_pool.act_syn;
+    @memcpy(ctx.worker_pool.weights[0..active_syn], ctx.base_pool.weights[0..active_syn]);
+    @memcpy(ctx.worker_pool.sources[0..active_syn], ctx.base_pool.sources[0..active_syn]);
+    @memcpy(ctx.worker_pool.targets[0..active_syn], ctx.base_pool.targets[0..active_syn]);
+    @memcpy(ctx.worker_pool.coeffs[0..active_syn * 5], ctx.base_pool.coeffs[0..active_syn * 5]);
+    ctx.worker_pool.act_syn = active_syn;
     // RESERVOIR
-    @memcpy(&ctx.worker_res.states, &ctx.base_res.states);
-    @memcpy(&ctx.worker_res.prev_states, &ctx.base_res.prev_states);
     @memcpy(&ctx.worker_res.leaks, &ctx.base_res.leaks);
     @memcpy(&ctx.worker_res.active_indices, &ctx.base_res.active_indices);
-    ctx.worker_res.active_neuron_count = ctx.base_res.active_neuron_count;
+    ctx.worker_res.active_neuron_count = active_nrn;
     @memcpy(&ctx.worker_res.active_mask, &ctx.base_res.active_mask);
-    @memcpy(&ctx.worker_res.input_sums, &ctx.base_res.input_sums);
+    ctx.worker_res.reset();
     // READOUT
     @memcpy(&ctx.worker_readout.weights, &ctx.base_readout.weights);
     ctx.worker_readout.bias = ctx.base_readout.bias;
-    ctx.worker_res.reset();
 
     // generate perturbation based on seed
-    for (0..ctx.worker_pool.act_syn * 5) |i| {
+    for (0..active_syn * 5) |i| {
         const epsilon = random.floatNorm(f32);
         ctx.worker_pool.coeffs[i] += epsilon * sigma;
     }
-    for (0..ctx.worker_readout.weights.len) |i| {
+    for (ctx.worker_res.active_indices[0..active_nrn]) |idx| {
         const epsilon = random.floatNorm(f32);
-        ctx.worker_readout.weights[i] += epsilon * sigma;
+        ctx.worker_readout.weights[idx] += epsilon * sigma;
     }
 
     // SIMULATION
@@ -338,10 +341,11 @@ pub fn runEvolution(
     }
 
     // This blocks the Main Thread until all 100 individuals are evaluated
+    print("Waiting for evaluation...\n", .{});
     wg.wait();
 
     // compare fitness scores, pick 25% best seeds, expand and apply to base genome
-    std.debug.print("All 100 evaluated. Selection starting...\n", .{});
+    // print("All 100 evaluated. Selection starting...\n", .{});
     const winners: usize = comptime population/4;
     std.mem.sort(Seed, &seeds, {}, descScore);
 
@@ -405,7 +409,7 @@ pub fn runEvolution(
     const expected_norm = std.math.sqrt(n_params) * (1.0 - (1.0 / (4.0 * n_params)) + (1.0 / (21.0 * n_params * n_params)));
     cma_state.sigma *= std.math.exp((c_sigma / d_sigma) * ((p_norm / expected_norm) - 1.0));
 
-    std.debug.print("Best Score: {d:.4} | New Sigma: {d:.6}\n", .{seeds[0].score, cma_state.sigma});
+    print("Best Score: {d:.4} | New Sigma: {d:.6}\n", .{seeds[0].score, cma_state.sigma});
 }
 
 pub fn evaluateBatch(
@@ -419,6 +423,99 @@ pub fn evaluateBatch(
         s.score = fitness(ctx, s.seed, input_data, target_data, sigma);
     }
 }
+
+const Trainer = struct {
+    allocator: std.mem.Allocator,
+    pool: std.Thread.Pool,
+    contexts: []WorkerContext,
+    cma_state: CmaState,
+
+    pub fn init(
+        allocator: std.mem.Allocator, 
+        num_workers: usize, 
+        base_pool: *const SynapsePool, 
+        base_res: *const Reservoir, 
+        base_readout: *const Readout) !*Trainer 
+    {
+        // pool alloc must be on the heap not to be garbage collected
+        const self = try allocator.create(Trainer);
+        self.allocator = allocator;
+        try self.pool.init(.{ .allocator = allocator, .n_jobs = @as(u32, @intCast(num_workers)) });
+
+        self.contexts = try allocator.alloc(WorkerContext, num_workers);
+        for (0..num_workers) |i| {
+            self.contexts[i] = .{
+                .worker_pool = try allocator.create(SynapsePool),
+                .worker_res = try allocator.create(Reservoir),
+                .worker_readout = try allocator.create(Readout),
+                .base_pool = base_pool,
+                .base_res = base_res,
+                .base_readout = base_readout,
+            };
+            // Initialize workers with base data initially
+            self.contexts[i].worker_res.init();
+            self.contexts[i].worker_pool.rndInit();
+            self.contexts[i].worker_readout.init();
+        }
+        
+
+        const cma = CmaState{
+            .sigma = 0.05,
+            .p_coeffs = try allocator.alloc(f32, MAX_SYNAPSES * 5),
+            .p_readout = try allocator.alloc(f32, NEURON_COUNT),
+        };
+        @memset(cma.p_coeffs, 0.0);
+        @memset(cma.p_readout, 0.0);
+        
+        self.cma_state = cma;
+
+        return self;
+    }
+
+    pub fn deinit(self: *Trainer) void {
+        for (self.contexts) |ctx| {
+            self.allocator.destroy(ctx.worker_pool);
+            self.allocator.destroy(ctx.worker_res);
+            self.allocator.destroy(ctx.worker_readout);
+        }
+        self.allocator.free(self.contexts);
+        self.allocator.free(self.cma_state.p_coeffs);
+        self.allocator.free(self.cma_state.p_readout);
+        self.pool.deinit();
+
+        self.allocator.destroy(self);
+    }
+
+    pub fn train(
+        self: *Trainer,
+        generations: usize,
+        comptime population: usize,
+        base_pool: *SynapsePool,
+        base_readout: *Readout,
+        input_data: []const f32,
+        target_data: []const f32,
+    ) !void {
+        print("Starting training for {d} generations...\n", .{generations});
+        
+        for (0..generations) |gen| {
+            try runEvolution(
+                &self.pool,
+                population,
+                self.contexts,
+                input_data,
+                target_data,
+                base_pool,
+                base_readout,
+                &self.cma_state,
+            );
+            print("Generation {d}...", .{gen});
+            if (gen % 10 == 0) {
+                // You can add logic here to save the best model to a file
+                // print("Generation {d} complete.\n", .{gen});
+            }
+        }
+    }
+};
 
 // --------------------------------------------------------------------------
 
@@ -442,17 +539,6 @@ pub fn main() !void {
     defer allocator.free(input_data);
     const target_data = try allocator.alloc(f32, sequence_len);
     defer allocator.free(target_data);
-
-    // 
-    var cma_state = CmaState{
-        .sigma = 0.05, // Initial std_dev
-        .p_coeffs = try allocator.alloc(f32, MAX_SYNAPSES * 5),
-        .p_readout = try allocator.alloc(f32, NEURON_COUNT),
-    };
-    @memset(cma_state.p_coeffs, 0.0);
-    @memset(cma_state.p_readout, 0.0);
-    defer allocator.free(cma_state.p_coeffs);
-    defer allocator.free(cma_state.p_readout);
 
     // warm-up
     for (0..100) |_| { _ = mg.next(); }
@@ -479,50 +565,14 @@ pub fn main() !void {
     readout.init();
 
     initialize(reservoir, synapses, 10);
+    
+    var trainer = try Trainer.init(allocator, NUM_WORKERS, synapses, reservoir, readout);
+    defer trainer.deinit();
 
-    // threads pool
-    var pool: std.Thread.Pool = undefined;
-    try pool.init(.{ .allocator = allocator, .n_jobs = 6 });
-    defer pool.deinit();
-
-    // create workers
-    var contexts: [6]WorkerContext = undefined;
-    for (0..6) |i| {
-        contexts[i] = .{
-            .worker_pool = try allocator.create(SynapsePool),
-            .worker_res = try allocator.create(Reservoir),
-            .worker_readout = try allocator.create(Readout),
-            .base_pool = synapses,
-            .base_res = reservoir,
-            .base_readout = readout,
-        };
-    }
-
-    defer {
-        for (contexts) |ctx| {
-            allocator.destroy(ctx.worker_pool);
-            allocator.destroy(ctx.worker_res);
-            allocator.destroy(ctx.worker_readout);
-        }
-    }
-
-    try runEvolution(
-        &pool, 
-        36, 
-        &contexts, 
-        input_data, 
-        target_data, 
-        synapses, 
-        readout,
-        &cma_state);
+    try trainer.train(1000, 144, synapses, readout, input_data, target_data);
+    
+    print("Evolution Finished.\n", .{});
 }
-
-
-
-
-
-
-
 
 
 
