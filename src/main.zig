@@ -5,10 +5,12 @@ const tests = @import("tests.zig");
 
 const print = std.debug.print;
 
+const POPULATION: usize = 576;
+const GENERATIONS: usize = 1000;
 const NEURON_COUNT: usize = 500;
 const COMPRESSED_SIZE: usize = 50;
 const MAX_SYNAPSES: usize = 10000;
-const NUM_WORKERS: usize = 11;
+const NUM_WORKERS: usize = 14;
 
 const Genotype = struct {
     compressed_coeffs: [5][COMPRESSED_SIZE]f32,
@@ -267,8 +269,19 @@ pub fn fitness(
         const error_val = prediction - target_data[i];
         total_sq_error += error_val * error_val;
     }
-
-    return total_sq_error / @as(f32, @floatFromInt(input_data.len));
+    
+    // L2 REGULARIZATION
+    var l2_sum: f32 = 0.0;
+    const lambda: f32 = 0.001;
+    for (0..active_syn * 5) |i| {
+        const c = ctx.worker_pool.coeffs[i];
+        l2_sum += c * c;
+    }
+    for (ctx.worker_res.active_indices[0..active_nrn]) |idx| {
+        const w = ctx.worker_readout.weights[idx];
+        l2_sum += w * w;
+    }
+    return total_sq_error / @as(f32, @floatFromInt(input_data.len)) + (lambda * l2_sum);
 }
 
 // washout plasticity may be a problem, also the washout should be on the training data
@@ -309,6 +322,7 @@ pub fn runEvolution(
     input_data: []const f32,
     target_data: []const f32,
     base_pool: *SynapsePool,
+    base_res: *const Reservoir,
     base_readout: *Readout,
     cma_state: *CmaState,
 ) !void {
@@ -365,8 +379,12 @@ pub fn runEvolution(
     }
     
 // --- CMA-ES Update Logic ---
+
+    const active_syn = base_pool.act_syn;
+    const active_nrn = base_res.active_neuron_count;
+
     const mu_eff = 1.0 / sum_sq_weights;
-    const n_params_usize = base_pool.act_syn * 5 + base_readout.weights.len;
+    const n_params_usize = active_syn * 5 + active_nrn;
     const n_params = @as(f32, @floatFromInt(n_params_usize));
 
     const c_sigma = (mu_eff + 2.0) / (n_params + mu_eff + 5.0);
@@ -374,8 +392,10 @@ pub fn runEvolution(
     const path_mult = std.math.sqrt(c_sigma * (2.0 - c_sigma) * mu_eff);
 
     // Decay the old evolution path
-    for (cma_state.p_coeffs[0..base_pool.act_syn * 5]) |*p| p.* *= (1.0 - c_sigma);
-    for (cma_state.p_readout[0..base_readout.weights.len]) |*p| p.* *= (1.0 - c_sigma);
+    for (cma_state.p_coeffs[0..active_syn * 5]) |*p| p.* *= (1.0 - c_sigma);
+    for (base_res.active_indices[0..active_nrn]) |idx| {
+        cma_state.p_readout[idx] *= (1.0 - c_sigma);
+    }
 
     // Reconstruct perturbations and apply updates
     for (0..winners) |i| {
@@ -392,18 +412,21 @@ pub fn runEvolution(
             base_pool.coeffs[j] += cma_state.sigma * step;
         }
 
-        for (0..base_readout.weights.len) |j| {
+        for (base_res.active_indices[0..active_nrn]) |idx| {
             const epsilon = random.floatNorm(f32);
             const step = log_weight * epsilon;
-            cma_state.p_readout[j] += path_mult * step;
-            base_readout.weights[j] += cma_state.sigma * step;
+            cma_state.p_readout[idx] += path_mult * step;
+            base_readout.weights[idx] += cma_state.sigma * step;
         }
     }
 
     // Update Sigma
     var p_norm_sq: f32 = 0.0;
-    for (cma_state.p_coeffs[0..base_pool.act_syn * 5]) |p| p_norm_sq += p * p;
-    for (cma_state.p_readout[0..base_readout.weights.len]) |p| p_norm_sq += p * p;
+    for (cma_state.p_coeffs[0..active_syn * 5]) |p| p_norm_sq += p * p;
+    for (base_res.active_indices[0..active_nrn]) |idx| {
+        const p = cma_state.p_readout[idx];
+        p_norm_sq += p * p;
+    }
     const p_norm = std.math.sqrt(p_norm_sq);
 
     const expected_norm = std.math.sqrt(n_params) * (1.0 - (1.0 / (4.0 * n_params)) + (1.0 / (21.0 * n_params * n_params)));
@@ -460,7 +483,7 @@ const Trainer = struct {
         
 
         const cma = CmaState{
-            .sigma = 0.05,
+            .sigma = 0.01,
             .p_coeffs = try allocator.alloc(f32, MAX_SYNAPSES * 5),
             .p_readout = try allocator.alloc(f32, NEURON_COUNT),
         };
@@ -491,6 +514,7 @@ const Trainer = struct {
         generations: usize,
         comptime population: usize,
         base_pool: *SynapsePool,
+        base_res: *const Reservoir,
         base_readout: *Readout,
         input_data: []const f32,
         target_data: []const f32,
@@ -505,6 +529,7 @@ const Trainer = struct {
                 input_data,
                 target_data,
                 base_pool,
+                base_res,
                 base_readout,
                 &self.cma_state,
             );
@@ -569,7 +594,7 @@ pub fn main() !void {
     var trainer = try Trainer.init(allocator, NUM_WORKERS, synapses, reservoir, readout);
     defer trainer.deinit();
 
-    try trainer.train(1000, 144, synapses, readout, input_data, target_data);
+    try trainer.train(GENERATIONS, POPULATION, synapses, reservoir, readout, input_data, target_data);
     
     print("Evolution Finished.\n", .{});
 }
