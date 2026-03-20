@@ -2,15 +2,16 @@ const std = @import("std");
 const mlzig = @import("mlzig");
 const analysis = @import("analysis.zig");
 const tests = @import("tests.zig");
+const reader = @import("parser.zig");
 
 const print = std.debug.print;
 
-const POPULATION: usize = 576;
+const POPULATION: usize = 144;
 const GENERATIONS: usize = 1000;
 const NEURON_COUNT: usize = 500;
 const COMPRESSED_SIZE: usize = 50;
 const MAX_SYNAPSES: usize = 10000;
-const NUM_WORKERS: usize = 14;
+const NUM_WORKERS: usize = 11;
 
 const Genotype = struct {
     compressed_coeffs: [5][COMPRESSED_SIZE]f32,
@@ -217,13 +218,19 @@ pub fn expand_genome(geno: [50]f32, pheno: *[1000]f32) void {
     }
 }
 
+const FitnessResult = struct {
+    mse: f32,
+    l2: f32,
+    score: f32,
+};
+
 pub fn fitness(
     ctx: *WorkerContext,
     seed: u64,
     input_data: []const f32,
     target_data: []const f32,
     sigma: f32,
-) f32 {
+) FitnessResult {
     const active_syn = ctx.base_pool.act_syn;
     const active_nrn = ctx.base_res.active_neuron_count;
 
@@ -235,7 +242,7 @@ pub fn fitness(
     @memcpy(ctx.worker_pool.weights[0..active_syn], ctx.base_pool.weights[0..active_syn]);
     @memcpy(ctx.worker_pool.sources[0..active_syn], ctx.base_pool.sources[0..active_syn]);
     @memcpy(ctx.worker_pool.targets[0..active_syn], ctx.base_pool.targets[0..active_syn]);
-    @memcpy(ctx.worker_pool.coeffs[0..active_syn * 5], ctx.base_pool.coeffs[0..active_syn * 5]);
+    @memcpy(ctx.worker_pool.coeffs[0 .. active_syn * 5], ctx.base_pool.coeffs[0 .. active_syn * 5]);
     ctx.worker_pool.act_syn = active_syn;
     // RESERVOIR
     @memcpy(&ctx.worker_res.leaks, &ctx.base_res.leaks);
@@ -269,7 +276,7 @@ pub fn fitness(
         const error_val = prediction - target_data[i];
         total_sq_error += error_val * error_val;
     }
-    
+
     // L2 REGULARIZATION
     var l2_sum: f32 = 0.0;
     const lambda: f32 = 0.001;
@@ -281,7 +288,13 @@ pub fn fitness(
         const w = ctx.worker_readout.weights[idx];
         l2_sum += w * w;
     }
-    return total_sq_error / @as(f32, @floatFromInt(input_data.len)) + (lambda * l2_sum);
+    const mse = total_sq_error / @as(f32, @floatFromInt(input_data.len));
+    const l2 = lambda * l2_sum;
+    return FitnessResult{
+        .mse = mse,
+        .l2 = l2,
+        .score = mse + l2,
+    };
 }
 
 // washout plasticity may be a problem, also the washout should be on the training data
@@ -297,17 +310,19 @@ pub fn washout(res: *Reservoir, pool: *SynapsePool, input_data: []const f32) voi
 const Seed = struct {
     seed: u64,
     score: f32,
+    mse: f32,
+    l2: f32,
 };
-fn descScore(context: void, a: Seed, b:Seed) bool {
+fn descScore(context: void, a: Seed, b: Seed) bool {
     _ = context;
     return a.score < b.score;
 }
 const CmaState = struct {
-    sigma: f32, 
+    sigma: f32,
     p_coeffs: []f32,
     p_readout: []f32,
-}; 
-// this function 
+};
+// this function
 // 1. generates random perturbation seeds
 // 2. sends the workers with the seeds to evaluate a batch of fitnesses
 // 3. wait for the evaluation to finish
@@ -325,8 +340,9 @@ pub fn runEvolution(
     base_res: *const Reservoir,
     base_readout: *Readout,
     cma_state: *CmaState,
+    prng: *std.Random.DefaultPrng,
 ) !void {
-    var prng = std.Random.DefaultPrng.init(42);
+    const seeds_random = prng.random();
 
     var wg = std.Thread.WaitGroup{};
     const num_workers = contexts.len;
@@ -335,7 +351,7 @@ pub fn runEvolution(
 
     // generate seeds
     for (&seeds) |*s| {
-        s.seed = prng.random().int(u64);
+        s.seed = seeds_random.int(u64);
     }
 
     // start workers
@@ -360,25 +376,25 @@ pub fn runEvolution(
 
     // compare fitness scores, pick 25% best seeds, expand and apply to base genome
     // print("All 100 evaluated. Selection starting...\n", .{});
-    const winners: usize = comptime population/4;
+    const winners: usize = comptime population / 4;
     std.mem.sort(Seed, &seeds, {}, descScore);
 
     var winners_weights: [winners]f32 = undefined;
     var sum_weights: f32 = 0.0;
-    for (0..winners) |i| { 
+    for (0..winners) |i| {
         const w_f32 = @as(f32, @floatFromInt(winners));
-        const i_f32 = @as(f32, @floatFromInt(i+1));
-        winners_weights[i] = @log(w_f32+0.5) - @log(i_f32);
-        sum_weights +=winners_weights[i];
+        const i_f32 = @as(f32, @floatFromInt(i + 1));
+        winners_weights[i] = @log(w_f32 + 0.5) - @log(i_f32);
+        sum_weights += winners_weights[i];
     }
-    
+
     var sum_sq_weights: f32 = 0.0;
-    for (0..winners) |i| { 
-        winners_weights[i] = winners_weights[i] / sum_weights; 
+    for (0..winners) |i| {
+        winners_weights[i] = winners_weights[i] / sum_weights;
         sum_sq_weights += winners_weights[i] * winners_weights[i];
     }
-    
-// --- CMA-ES Update Logic ---
+
+    // --- CMA-ES Update Logic ---
 
     const active_syn = base_pool.act_syn;
     const active_nrn = base_res.active_neuron_count;
@@ -392,7 +408,7 @@ pub fn runEvolution(
     const path_mult = std.math.sqrt(c_sigma * (2.0 - c_sigma) * mu_eff);
 
     // Decay the old evolution path
-    for (cma_state.p_coeffs[0..active_syn * 5]) |*p| p.* *= (1.0 - c_sigma);
+    for (cma_state.p_coeffs[0 .. active_syn * 5]) |*p| p.* *= (1.0 - c_sigma);
     for (base_res.active_indices[0..active_nrn]) |idx| {
         cma_state.p_readout[idx] *= (1.0 - c_sigma);
     }
@@ -422,7 +438,7 @@ pub fn runEvolution(
 
     // Update Sigma
     var p_norm_sq: f32 = 0.0;
-    for (cma_state.p_coeffs[0..active_syn * 5]) |p| p_norm_sq += p * p;
+    for (cma_state.p_coeffs[0 .. active_syn * 5]) |p| p_norm_sq += p * p;
     for (base_res.active_indices[0..active_nrn]) |idx| {
         const p = cma_state.p_readout[idx];
         p_norm_sq += p * p;
@@ -432,18 +448,21 @@ pub fn runEvolution(
     const expected_norm = std.math.sqrt(n_params) * (1.0 - (1.0 / (4.0 * n_params)) + (1.0 / (21.0 * n_params * n_params)));
     cma_state.sigma *= std.math.exp((c_sigma / d_sigma) * ((p_norm / expected_norm) - 1.0));
 
-    print("Best Score: {d:.4} | New Sigma: {d:.6}\n", .{seeds[0].score, cma_state.sigma});
+    print("Best MSE: {d:.6} | L2: {d:.6} | Sigma: {d:.4}\n", .{ seeds[0].mse, seeds[0].l2, cma_state.sigma });
 }
 
 pub fn evaluateBatch(
     ctx: *WorkerContext,
-    seeds: [] Seed,
+    seeds: []Seed,
     input_data: []const f32,
     target_data: []const f32,
     sigma: f32,
 ) void {
     for (seeds) |*s| {
-        s.score = fitness(ctx, s.seed, input_data, target_data, sigma);
+        const res = fitness(ctx, s.seed, input_data, target_data, sigma);
+        s.score = res.score;
+        s.mse = res.mse;
+        s.l2 = res.l2;
     }
 }
 
@@ -452,14 +471,9 @@ const Trainer = struct {
     pool: std.Thread.Pool,
     contexts: []WorkerContext,
     cma_state: CmaState,
+    prng: std.Random.DefaultPrng,
 
-    pub fn init(
-        allocator: std.mem.Allocator, 
-        num_workers: usize, 
-        base_pool: *const SynapsePool, 
-        base_res: *const Reservoir, 
-        base_readout: *const Readout) !*Trainer 
-    {
+    pub fn init(allocator: std.mem.Allocator, num_workers: usize, base_pool: *const SynapsePool, base_res: *const Reservoir, base_readout: *const Readout) !*Trainer {
         // pool alloc must be on the heap not to be garbage collected
         const self = try allocator.create(Trainer);
         self.allocator = allocator;
@@ -480,7 +494,6 @@ const Trainer = struct {
             self.contexts[i].worker_pool.rndInit();
             self.contexts[i].worker_readout.init();
         }
-        
 
         const cma = CmaState{
             .sigma = 0.01,
@@ -489,8 +502,9 @@ const Trainer = struct {
         };
         @memset(cma.p_coeffs, 0.0);
         @memset(cma.p_readout, 0.0);
-        
+
         self.cma_state = cma;
+        self.prng = std.Random.DefaultPrng.init(42);
 
         return self;
     }
@@ -520,7 +534,7 @@ const Trainer = struct {
         target_data: []const f32,
     ) !void {
         print("Starting training for {d} generations...\n", .{generations});
-        
+
         for (0..generations) |gen| {
             try runEvolution(
                 &self.pool,
@@ -532,6 +546,7 @@ const Trainer = struct {
                 base_res,
                 base_readout,
                 &self.cma_state,
+                &self.prng,
             );
             print("Generation {d}...", .{gen});
             if (gen % 10 == 0) {
@@ -545,6 +560,13 @@ const Trainer = struct {
 // --------------------------------------------------------------------------
 
 pub fn main() !void {
+
+    var parser = reader.Reader{
+        .length = 0,
+        .vocab_len = 0,
+    };
+    try parser.read("tinyshakespeare.txt");
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -566,7 +588,9 @@ pub fn main() !void {
     defer allocator.free(target_data);
 
     // warm-up
-    for (0..100) |_| { _ = mg.next(); }
+    for (0..100) |_| {
+        _ = mg.next();
+    }
     // gen
     var current_val = mg.next();
     for (0..sequence_len) |i| {
@@ -590,18 +614,11 @@ pub fn main() !void {
     readout.init();
 
     initialize(reservoir, synapses, 10);
-    
+
     var trainer = try Trainer.init(allocator, NUM_WORKERS, synapses, reservoir, readout);
     defer trainer.deinit();
 
     try trainer.train(GENERATIONS, POPULATION, synapses, reservoir, readout, input_data, target_data);
-    
+
     print("Evolution Finished.\n", .{});
 }
-
-
-
-
-
-
-
