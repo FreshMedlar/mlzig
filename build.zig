@@ -29,16 +29,7 @@ pub fn build(b: *std.Build) void {
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
     const mod = b.addModule("mlzig", .{
-        // The root source file is the "entry point" of this module. Users of
-        // this module will only be able to access public declarations contained
-        // in this file, which means that if you have declarations that you
-        // intend to expose to consumers that were defined in other files part
-        // of this module, you will have to make sure to re-export them from
-        // the root file.
-        .root_source_file = b.path("src/root.zig"),
-        // Later on we'll use this module as the root module of a test executable
-        // which requires us to specify a target.
-        .target = target,
+        .root_source_file = b.path("src/main.zig"),
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -59,29 +50,11 @@ pub fn build(b: *std.Build) void {
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
         .name = "mlzig",
-        .root_module = b.createModule(.{
-            // b.createModule defines a new module just like b.addModule but,
-            // unlike b.addModule, it does not expose the module to consumers of
-            // this package, which is why in this case we don't have to give it a name.
-            .root_source_file = b.path("src/main.zig"),
-            // Target and optimization levels must be explicitly wired in when
-            // defining an executable or library (in the root module), and you
-            // can also hardcode a specific target for an executable or library
-            // definition if desireable (e.g. firmware for embedded devices).
-            .target = target,
-            .optimize = optimize,
-            // List of modules available for import in source files part of the
-            // root module.
-            .imports = &.{
-                // Here "mlzig" is the name you will use in your source code to
-                // import this module (e.g. `@import("mlzig")`). The name is
-                // repeated because you are allowed to rename your imports, which
-                // can be extremely useful in case of collisions (which can happen
-                // importing modules from different packages).
-                .{ .name = "mlzig", .module = mod },
-            },
-        }),
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    exe.root_module.addImport("mlzig", mod);
 
     // BLAS libs
     exe.linkSystemLibrary("openblas");
@@ -124,7 +97,9 @@ pub fn build(b: *std.Build) void {
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
     const mod_tests = b.addTest(.{
-        .root_module = mod,
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
     });
 
     // A run step that will run the test executable.
@@ -134,8 +109,11 @@ pub fn build(b: *std.Build) void {
     // root module. Note that test executables only test one module at a time,
     // hence why we have to create two separate ones.
     const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    exe_tests.root_module.addImport("mlzig", mod);
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
