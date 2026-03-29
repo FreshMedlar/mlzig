@@ -9,8 +9,6 @@ const GENERATIONS: usize = 1000;
 const NEURON_COUNT: usize = 1000;
 const COMPRESSED_SIZE: usize = 100;
 const READOUT_COMPRESSED_SIZE: usize = 100;
-const SPARSITY: usize = 50; // connections per neuron (10% of 500)
-const MAX_SYNAPSES: usize = NEURON_COUNT * SPARSITY;
 const NUM_WORKERS: usize = 8;
 
 const SEQUENCE_LEN: usize = 200;
@@ -33,19 +31,12 @@ const Reservoir = struct {
     states: [NEURON_COUNT]f32 = undefined,
     prev_states: [NEURON_COUNT]f32 = undefined,
     leaks: [NEURON_COUNT]f32 = undefined,
-
-    active_indices: [NEURON_COUNT]u32 = undefined,
-    active_neuron_count: usize = 0,
-    active_mask: [NEURON_COUNT / 8]u8 = [_]u8{0} ** (NEURON_COUNT / 8),
     input_sums: [NEURON_COUNT]f32 = undefined,
 
     pub fn init(self: *Reservoir) void {
         @memset(&self.states, 0.0);
         @memset(&self.prev_states, 0.0);
         @memset(&self.leaks, 0.8);
-        @memset(&self.active_indices, 0);
-        self.active_neuron_count = 0;
-        @memset(&self.active_mask, 0);
         @memset(&self.input_sums, 0.0);
     }
 
@@ -54,45 +45,15 @@ const Reservoir = struct {
         @memset(&self.prev_states, 0.0);
         @memset(&self.input_sums, 0.0);
     }
-
-    pub fn markActive(self: *Reservoir, idx: u32) void {
-        const byte_idx = idx / 8;
-        const bit_idx = @as(u3, @intCast(idx % 8));
-        const mask = @as(u8, 1) << bit_idx;
-
-        if (self.active_mask[byte_idx] & mask == 0) {
-            self.active_mask[byte_idx] |= mask;
-            self.active_indices[self.active_neuron_count] = idx;
-            self.active_neuron_count += 1;
-        }
-    }
 };
 
 const SynapsePool = struct {
-    weights: [MAX_SYNAPSES]f32 = undefined,
-    sources: [MAX_SYNAPSES]u32 = undefined,
-    targets: [MAX_SYNAPSES]u32 = undefined,
-    coeffs: [MAX_SYNAPSES * 5]f32 = undefined,
-    act_syn: usize = 0,
-
-    pub fn addConnection(self: *SynapsePool, res: *Reservoir, src: u32, dst: u32, w: f32) void {
-        if (self.act_syn >= MAX_SYNAPSES) return;
-        const idx = self.act_syn;
-        self.weights[idx] = w;
-        self.sources[idx] = src;
-        self.targets[idx] = dst;
-        self.act_syn += 1;
-
-        res.markActive(src);
-        res.markActive(dst);
-    }
+    weights: [NEURON_COUNT][NEURON_COUNT]f32 = undefined,
+    coeffs: [5][NEURON_COUNT][NEURON_COUNT]f32 = undefined,
 
     pub fn rndInit(self: *SynapsePool) void {
-        @memset(&self.weights, 0.0);
-        @memset(&self.sources, 0);
-        @memset(&self.targets, 0);
-        @memset(&self.coeffs, 0.0);
-        self.act_syn = 0;
+        @memset(std.mem.asBytes(&self.weights), 0);
+        @memset(std.mem.asBytes(&self.coeffs), 0);
     }
 };
 
@@ -110,15 +71,15 @@ const WorkerContext = struct {
 pub fn forward(res: *Reservoir, pool: *SynapsePool) void {
     @memcpy(&res.prev_states, &res.states);
 
-    for (res.active_indices[0..res.active_neuron_count]) |idx| {
-        res.input_sums[idx] = 0.0;
+    for (0..NEURON_COUNT) |dst| {
+        var sum: f32 = 0.0;
+        for (0..NEURON_COUNT) |src| {
+            sum += pool.weights[dst][src] * res.states[src];
+        }
+        res.input_sums[dst] = sum;
     }
 
-    for (pool.weights[0..pool.act_syn], pool.sources[0..pool.act_syn], pool.targets[0..pool.act_syn]) |w, src, dst| {
-        res.input_sums[dst] += w * res.states[src];
-    }
-
-    for (res.active_indices[0..res.active_neuron_count]) |idx| {
+    for (0..NEURON_COUNT) |idx| {
         const input = res.input_sums[idx];
         const safe_in = std.math.clamp(input, -50.0, 50.0);
         const leak = res.leaks[idx];
@@ -128,47 +89,42 @@ pub fn forward(res: *Reservoir, pool: *SynapsePool) void {
 }
 
 pub fn applyPlasticity(res: *Reservoir, pool: *SynapsePool) void {
-    for (0..pool.act_syn) |i| {
-        const src = pool.sources[i];
-        const dst = pool.targets[i];
-        const pre = res.prev_states[src];
-        const post = res.states[dst];
+    for (0..NEURON_COUNT) |dst| {
+        for (0..NEURON_COUNT) |src| {
+            const pre = res.prev_states[src];
+            const post = res.states[dst];
 
-        const c_idx = i * 5;
-        const c0 = pool.coeffs[c_idx + 0];
-        const c1 = pool.coeffs[c_idx + 1];
-        const c2 = pool.coeffs[c_idx + 2];
-        const c3 = pool.coeffs[c_idx + 3];
-        const c4 = pool.coeffs[c_idx + 4];
+            const c0 = pool.coeffs[0][dst][src];
+            const c1 = pool.coeffs[1][dst][src];
+            const c2 = pool.coeffs[2][dst][src];
+            const c3 = pool.coeffs[3][dst][src];
+            const c4 = pool.coeffs[4][dst][src];
 
-        const delta = c0 * (c1 * pre * post + c2 * pre + c3 * post + c4);
-        pool.weights[i] += delta;
-        pool.weights[i] = std.math.clamp(pool.weights[i], -2.0, 2.0);
+            const delta = c0 * (c1 * pre * post + c2 * pre + c3 * post + c4);
+            pool.weights[dst][src] += delta;
+            pool.weights[dst][src] = std.math.clamp(pool.weights[dst][src], -2.0, 2.0);
+        }
     }
 }
 
 // --- Improvement 1: Sparse random connectivity ---
 pub fn initialize(res: *Reservoir, pool: *SynapsePool) void {
-    // Mark all as active
-    for (0..NEURON_COUNT) |i| {
-        res.markActive(@intCast(i));
-    }
+    res.init();
 
-    // Sparse random connections: each neuron connects to SPARSITY random targets
+    // Dense connections: each neuron connects to all others
     var prng = std.Random.DefaultPrng.init(42);
     const random = prng.random();
 
-    for (0..NEURON_COUNT) |n| {
-        for (0..SPARSITY) |_| {
-            const target = random.uintLessThan(u32, NEURON_COUNT);
-            // Small initial weight scaled by 1/sqrt(SPARSITY) for stable dynamics
-            const w: f32 = (random.float(f32) - 0.5) * 2.0 / @as(f32, @sqrt(@as(f32, @floatFromInt(SPARSITY))));
-            pool.addConnection(res, @intCast(n), target, w);
+    for (0..NEURON_COUNT) |dst| {
+        for (0..NEURON_COUNT) |src| {
+            // Small initial weight scaled by 1/sqrt(NEURON_COUNT) for stable dynamics
+            const w: f32 = (random.float(f32) - 0.5) * 2.0 / @as(f32, @sqrt(@as(f32, @floatFromInt(NEURON_COUNT))));
+            pool.weights[dst][src] = w;
         }
     }
 }
 
-pub fn expand_genome(geno: *const Genotype, pheno_coeffs: []f32, sources: []const u32, targets: []const u32, act_syn: usize) void {
+pub fn expand_genome(geno: *const Genotype, pheno_coeffs: *[5][NEURON_COUNT][NEURON_COUNT]f32) void {
     var cx: [10][NEURON_COUNT]f32 = undefined;
     for (0..10) |f| {
         const freq = @as(f32, @floatFromInt(f + 1));
@@ -190,14 +146,14 @@ pub fn expand_genome(geno: *const Genotype, pheno_coeffs: []f32, sources: []cons
             }
         }
 
-        for (0..act_syn) |i| {
-            const src = sources[i];
-            const dst = targets[i];
-            var val: f32 = 0.0;
-            for (0..10) |fx| {
-                val += cx[fx][src] * temp[fx][dst];
+        for (0..NEURON_COUNT) |src| {
+            for (0..NEURON_COUNT) |dst| {
+                var val: f32 = 0.0;
+                for (0..10) |fx| {
+                    val += cx[fx][src] * temp[fx][dst];
+                }
+                pheno_coeffs[t][dst][src] = val;
             }
-            pheno_coeffs[i * 5 + t] = val;
         }
     }
 }
@@ -253,9 +209,6 @@ fn ascScore(context: void, a: Seed, b: Seed) bool {
 }
 
 pub fn fitness(ctx: *WorkerContext, seed_data: *Seed, data_chunk: []const usize, sigma: f32, cur_steps: usize) void {
-    const active_syn = ctx.base_pool.act_syn;
-    const active_nrn = ctx.base_res.active_neuron_count;
-
     var prng = std.Random.DefaultPrng.init(seed_data.seed);
     const random = prng.random();
 
@@ -279,18 +232,12 @@ pub fn fitness(ctx: *WorkerContext, seed_data: *Seed, data_chunk: []const usize,
     expand_readout(&ctx.worker_geno.readout_coeffs, ctx.readout_weights);
 
     // Synapse Base Copy
-    @memcpy(ctx.worker_pool.weights[0..active_syn], ctx.base_pool.weights[0..active_syn]);
-    @memcpy(ctx.worker_pool.sources[0..active_syn], ctx.base_pool.sources[0..active_syn]);
-    @memcpy(ctx.worker_pool.targets[0..active_syn], ctx.base_pool.targets[0..active_syn]);
-    ctx.worker_pool.act_syn = active_syn;
+    @memcpy(std.mem.asBytes(&ctx.worker_pool.weights), std.mem.asBytes(&ctx.base_pool.weights));
 
-    expand_genome(ctx.worker_geno, &ctx.worker_pool.coeffs, ctx.worker_pool.sources[0..active_syn], ctx.worker_pool.targets[0..active_syn], active_syn);
+    expand_genome(ctx.worker_geno, &ctx.worker_pool.coeffs);
 
     // Res Base Copy
     @memcpy(&ctx.worker_res.leaks, &ctx.base_res.leaks);
-    @memcpy(&ctx.worker_res.active_indices, &ctx.base_res.active_indices);
-    ctx.worker_res.active_neuron_count = active_nrn;
-    @memcpy(&ctx.worker_res.active_mask, &ctx.base_res.active_mask);
     ctx.worker_res.reset();
 
     var total_loss: f32 = 0.0;
@@ -425,7 +372,6 @@ const Trainer = struct {
     // --- Improvement 6: Sample text generation ---
     fn generateSample(self: *Trainer, base_pool_ptr: *const SynapsePool, base_res_ptr: *const Reservoir) void {
         const ctx = &self.contexts[0];
-        const active_syn = base_pool_ptr.act_syn;
 
         // Copy base genotype (no mutation)
         @memcpy(&ctx.worker_geno.coeffs, &self.base_genotype.coeffs);
@@ -433,17 +379,11 @@ const Trainer = struct {
 
         expand_readout(&ctx.worker_geno.readout_coeffs, ctx.readout_weights);
 
-        @memcpy(ctx.worker_pool.weights[0..active_syn], base_pool_ptr.weights[0..active_syn]);
-        @memcpy(ctx.worker_pool.sources[0..active_syn], base_pool_ptr.sources[0..active_syn]);
-        @memcpy(ctx.worker_pool.targets[0..active_syn], base_pool_ptr.targets[0..active_syn]);
-        ctx.worker_pool.act_syn = active_syn;
+        @memcpy(std.mem.asBytes(&ctx.worker_pool.weights), std.mem.asBytes(&base_pool_ptr.weights));
 
-        expand_genome(ctx.worker_geno, &ctx.worker_pool.coeffs, ctx.worker_pool.sources[0..active_syn], ctx.worker_pool.targets[0..active_syn], active_syn);
+        expand_genome(ctx.worker_geno, &ctx.worker_pool.coeffs);
 
         @memcpy(&ctx.worker_res.leaks, &base_res_ptr.leaks);
-        @memcpy(&ctx.worker_res.active_indices, &base_res_ptr.active_indices);
-        ctx.worker_res.active_neuron_count = base_res_ptr.active_neuron_count;
-        @memcpy(&ctx.worker_res.active_mask, &base_res_ptr.active_mask);
         ctx.worker_res.reset();
 
         // Seed with a space character
@@ -652,9 +592,8 @@ pub fn main() !void {
     defer allocator.destroy(synapses);
     synapses.rndInit();
 
-    print("Initializing reservoir connections (sparse, {d} per neuron)...\n", .{SPARSITY});
+    print("Initializing reservoir connections (dense)...\n", .{});
     initialize(reservoir, synapses);
-    print("Synapses created: {d}\n", .{synapses.act_syn});
 
     var trainer = try Trainer.init(allocator, NUM_WORKERS, synapses, reservoir, &dataset);
     defer trainer.deinit();
